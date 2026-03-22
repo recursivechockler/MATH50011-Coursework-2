@@ -394,7 +394,7 @@ Three findings emerge. Firstly, the LRT shows sex is a significant recidivism pr
 
 The main takeaway is not that COMPAS is biased because of its use of race, but that the covariate structure as a whole is racially inflected. An ostensibly race-neutral (legal) variable, prior arrest count encodes differences in policing between the groups, creating a negative feedback loop as stricter policing leads to harsher COMPAS judgements, leading to increased surveillance of African Americans. One possible solution would be to exclude prior arrests count from the model. However, this is intuitively a strong indicator of recidivism rate, and would likely be strongly correlated with observations even without the effects of the policing differential. Model fairness cannot be achieved by feature exclusion alone when the remaining features are themselves products of racially unequal enforcement practices. This leads back to an ethical question rather than a statistical one: do we exclude racially motivated predictors, even if they are the strongest that the model has? And, if not, how do we fairly account for proxy action when evaluating a feature's effect on model predictions?
 
-![Borden was rated high risk of recidivism after she and a friend took a bike that was sitting outside. She did not reoffend. Prater, labelled as minimal risk, has a history of armed robbery.](overestimation.png){width=30% fig-align="center"}
+![Borden was rated a high risk of recidivism after she and a friend took a bike that was sitting outside. She did not reoffend. Prater, labelled as minimal risk, has a history of armed robbery.](overestimation.png){width=30% fig-align="center"}
 
 # Critical use of AI tools
 
