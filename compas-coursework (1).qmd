@@ -1,0 +1,403 @@
+---
+title: "Algorithmic Bias in the COMPAS Recidivism Model"
+author: 
+- "Michael Chockler"
+- "CID: 02385539"
+date: today
+format:
+  pdf:
+    documentclass: article
+    fontsize: 11pt
+    geometry: margin=2.3cm
+    number-sections: true
+    colorlinks: true
+    fig-pos: "H"
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(here)
+```
+
+# Why this question
+
+Algorithmic tools are regularly used in the criminal justice system to recommend sentencing decisions. One such algorithm is the COMPAS score (Correctional Offender Management Profiling for Alternative Sanctions). This is used across several US states to advise judges on convict recidivism (reoffending) risk, and is a crucial factor especially in bail decisions. However, it has faced deep scrutiny in the disparity of its treatment of Black versus Caucasian defendants, often overestimating the risk for the former and underestimating for the latter.^[J. Angwin et al., "Machine Bias," *ProPublica*, May 2016. \url{https://www.propublica.org/article/machine-bias-risk-assessments-in-criminal-sentencing}]
+
+Here, I aim to apply rigorous statistical analysis to the question of whether race truly remains a significant predictor of recidivism even after controlling for legally permissible covariates (features that a court of law is legally allowed to take into account -- obviously race is not one). I will proceed through generalised linear models, likelihood ratio testing, and regression diagnostics. Beyond the statistics however, I feel that this is a question of genuine social consequence. To allow prejudice in the criminal justice system is morally wrong, but can a case be made for it when deciding which criminals are too dangerous to be released?
+
+I decided to answer this question because opacity in algorithmic decision-making becomes a bigger problem every day, as machine learning models get less interpretable, yet are used to answer bigger questions, such as *"can a convict be trusted to re-enter the public sphere?"* The same framework used to quantify a predictor's coefficient can also be used to scrutinise its biases and assumptions; an especially important feature for modern statistical modelling, particularly when used in life-changing decisions. The full source code and data for this analysis are available on GitHub.^[Source code: \url{https://github.com/recursivechockler/MATH50011-Coursework-2}]
+ 
+# Data
+
+## Source and loading
+
+```{r load-data}
+raw <- read_csv("compas-scores-two-years.csv", show_col_types = FALSE)
+```
+```{r clean-data}
+compas <- raw |>
+  filter(
+    days_b_screening_arrest >= -30,
+    days_b_screening_arrest <= 30,
+    is_recid != -1,
+    c_charge_degree != "O",
+    score_text != "N/A"
+  ) |>
+  mutate(
+    race = fct_relevel(race, "Caucasian"),
+    sex  = fct_relevel(sex,  "Male"),
+    c_charge_degree = factor(c_charge_degree)
+  ) |>
+  select(
+    two_year_recid, race, sex, age, priors_count = priors_count...15,
+    c_charge_degree, juv_fel_count, juv_misd_count
+  )
+```
+
+The data is of `r nrow(compas)` defendants from Broward County, Florida (2013--14). Note that this is after applying the standard exclusions from the data, such as non-criminal charges and unknown recidivism statuses. There are not many such data points, so imputation was not necessary.^[Dataset and filtering methodology: \url{https://github.com/propublica/compas-analysis}] The measured outcome is then `two_year_recid`, a binary indicator of whether a person was rearrested within two years. We later model this using independent Bernoulli variables.
+
+```{r tbl-summary}
+#| tbl-cap: "Sample counts by race and sex"
+compas |>
+  count(race, sex) |>
+  pivot_wider(names_from = sex, values_from = n, values_fill = 0) |>
+  knitr::kable(booktabs = TRUE)
+```
+
+## Exploratory analysis
+
+@fig-rates shows major differences in recidivism rates across different racial groups and genders. Especially notable is a 13% higher recidivism rate in African-American defendants than in Caucasian defendants and an equal difference between males and females in the sample.^[Even more surprising in my opinion, and somewhat upsetting, is the general rate of recidivism. It is far higher than one would expect, with almost every other male convict reoffending within two years.] These differences do not imply any causal relationships, as they may reflect differences in legally relevant covariates, however they do motivate model-based inquiry.
+
+```{r fig-rates}
+#| fig-cap: "Observed two-year recidivism rates by race (left) and sex (right)"
+#| fig-width: 7
+#| fig-height: 2.5
+
+p1 <- compas |>
+  group_by(race) |>
+  summarise(rate = mean(two_year_recid), n = n()) |>
+  ggplot(aes(x = fct_reorder(race, rate), y = rate)) +
+  geom_col(fill = "steelblue", width = 0.6) +
+  geom_text(aes(label = scales::percent(rate, 1)),
+            hjust = -0.15, size = 2.8) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.75)) +
+  coord_flip() +
+  labs(x = NULL, y = "Recidivism rate") +
+  theme_minimal(base_size = 9)
+
+p2 <- compas |>
+  group_by(sex) |>
+  summarise(rate = mean(two_year_recid)) |>
+  ggplot(aes(x = sex, y = rate)) +
+  geom_col(fill = "steelblue", width = 0.4) +
+  geom_text(aes(label = scales::percent(rate, 1)),
+            vjust = -0.5, size = 2.8) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.65)) +
+  labs(x = NULL, y = "Recidivism rate") +
+  theme_minimal(base_size = 9)
+
+library(patchwork)
+p1 + p2
+```
+
+A major concern in the data is collinearity of variables. It is likely (and we will test) that some features, such as prior arrest count and age, are correlated with race, so would act as proxies even in a race-blind model, creating bias towards protected attributes, even when they are not included in the model themselves. As a precursor to this belief, @fig-proxies hints that African-American defendants have a more right-skewed prior count distribution and a somewhat younger age profile than Caucasian defendants. All this goes to say that even a model that doesn't know the race or gender of a defendant may still come up with the same conclusion as one that does.
+
+```{r fig-proxies}
+#| fig-cap: "Distributions of prior arrest count (left) and age (right) by race (two largest groups)"
+#| fig-width: 7
+#| fig-height: 2.5
+
+two_races <- compas |> filter(race %in% c("African-American", "Caucasian"))
+
+p3 <- two_races |>
+  ggplot(aes(x = pmin(priors_count, 20), fill = race)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 21, position = "identity",
+                 alpha = 0.55, colour = "white", linewidth = 0.2) +
+  scale_x_continuous(breaks = c(0, 5, 10, 15, 20),
+                     labels = c("0", "5", "10", "15", "20+")) +
+  scale_fill_manual(values = c("steelblue", "coral")) +
+  labs(x = "Prior arrests (capped at 20)", y = "Density", fill = NULL) +
+  theme_minimal(base_size = 9) +
+  theme(legend.position = "bottom")
+
+p4 <- two_races |>
+  ggplot(aes(x = age, fill = race)) +
+  geom_density(alpha = 0.5, colour = NA) +
+  scale_fill_manual(values = c("steelblue", "coral")) +
+  labs(x = "Age", y = "Density", fill = NULL) +
+  theme_minimal(base_size = 9) +
+  theme(legend.position = "bottom")
+
+p3 + p4 + plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+# Model specification and fitting
+
+## The generalised linear model
+
+Let random variables $Y_i \in \{0,1\}$ denote the two-year recidivism indicator for defendant $i$, and let $\mathbf{x}_i$ denote a vector of covariates (a column of the design matrix). We model
+$$
+Y_i \sim \text{Bernoulli}(\pi_i) \;\text{independently},
+\qquad
+\text{logit}(\pi_i) = \mathbf{x}_i^\top\boldsymbol{\beta},
+$$
+where logit$(\pi_i)$ is the log odds of reoffending -- a linear function of the observation's covariate values. Log odds can be interpreted as the factor by which an event is more likely to happen than not, and are a standard mapping from the probability domain to the real domain: log$(π/(1−π))$ maps $(0,1)$ to $\mathbb{R}$. This makes log odds compatible with a linear predictor. Moreover, this is not an arbitrary choice, but the canonical link function, emerging from the exponential family form of the distribution. Now, as $\hat\beta$ for GLMs has no closed form, we instead use a computational technique of approximating it -- iteratively reweighted least squares. Under regularity conditions, $\hat{\boldsymbol{\beta}} \xrightarrow{d} \mathcal{N}\!\bigl(\boldsymbol{\beta},\,(\mathbf{X}^\top\mathbf{W}\mathbf{X})^{-1}\bigr)$, where the diagonal weights matrix used is $\mathbf{W} = \operatorname{diag}$ $\!\bigl(\hat\pi_i(1-\hat\pi_i)\bigr)$. This is a diagonal of the (MLE) variances of each $Y_i$, used in place of $\sigma^2I$ in OLS as variance here is heteroskedastic and depends on the fitted values (an extension on 5.1.2 from the course notes on the asymptotic normality of MLEs).
+
+We then separate protected attributes from legally permissible covariates by fitting three models: **M0** (age, prior count, juvenile counts, charge degree), **M1** (M0 + sex), and **M2** (M1 + race).
+
+```{r fit-models}
+M0 <- glm(two_year_recid ~ age + priors_count + juv_fel_count +
+            juv_misd_count + c_charge_degree,
+          data = compas, family = binomial)
+
+M1 <- glm(two_year_recid ~ age + priors_count + juv_fel_count +
+            juv_misd_count + c_charge_degree + sex,
+          data = compas, family = binomial)
+
+M2 <- glm(two_year_recid ~ age + priors_count + juv_fel_count +
+            juv_misd_count + c_charge_degree + sex + race,
+          data = compas, family = binomial)
+```
+
+## Parameter estimates
+
+@tbl-coefs shows the M2 coefficient estimates on using the log-odds (infinite domain) scale, together with odds ratios, which convey the factor by which recidivism odds changes in the model when a covariate is incremented and all others are held constant. Specifically, OR > 1 $\implies$ increase in recidivism odds, OR < 1 $\implies$ decrease in recidivism odds, and OR = 1 $\implies$ no effect. Reference categories are Caucasian and Male.^[See Dummy Variable trap: \url{https://www.learndatasci.com/glossary/dummy-variable-trap}]
+
+\pagebreak
+
+```{r tbl-coefs}
+#| tbl-cap: "M2 coefficient estimates with 95\\% confidence intervals. OR = exp(estimate)."
+library(broom)
+
+tidy(M2, conf.int = TRUE) |>
+  mutate(
+    OR = exp(estimate),
+    term = term |>
+      str_replace("raceCaucasian", "race: Caucasian (ref)") |>
+      str_replace("race", "race: ") |>
+      str_replace("sexFemale", "sex: Female") |>
+      str_replace("c_charge_degreeM", "charge: misdemeanour") |>
+      str_replace_all("_", " ")
+  ) |>
+  select(Term = term, Estimate = estimate, SE = std.error,
+         `95% CI low` = conf.low, `95% CI high` = conf.high, OR) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  knitr::kable(booktabs = TRUE)
+```
+
+From this we can see that, when controlling for other factors, the direct race effect is modest, as the African-American coefficient is only approximately 0.053 and has a 95% confidence interval crossing zero. We investigate this formally below.
+
+# Testing for bias
+
+## Likelihood ratio tests
+
+We use deviance scores, $D_0$ and $D_1$, calculated for each model respectively, to diagnose badness-of-fit of models using more parameters and those using fewer. Deviance is defined as $D = -2\,\ell(\hat{\beta})$, where $\ell(\hat{\beta})$ is the log likelihood of $\hat{\beta}$ and the factor of 2 is to make the difference in deviance follow a chi-square distribution. Lower deviance means a better fit, and adding covariates can only reduce deviance.
+
+To test then whether extra covariates actually improve fit, we compare two nested models via the likelihood ratio statistic (Theorem 6 in the lecture notes):
+$$
+\Lambda = D_0 - D_1 \xrightarrow{d} \chi^2_q \quad \text{under } H_0,
+$$
+This is just double the log-likelihood improvement. A large $\Lambda$ gives small p-values, evidence to reject the null hypothesis and suggest that extra covariates are significant for model fit.
+
+**Test 1** (M0 vs M1): $H_0\colon \beta_{\text{sex}} = 0$, $q = 1$.
+**Test 2** (M1 vs M2): $H_0\colon \beta_{\text{race},j} = 0$ for all $j$, $q = 5$.
+
+```{r lrt}
+lambda_sex  <- round(deviance(M0) - deviance(M1), 2)
+lambda_race <- round(deviance(M1) - deviance(M2), 2)
+df_sex  <- M0$df.residual - M1$df.residual
+df_race <- M1$df.residual - M2$df.residual
+p_sex   <- pchisq(lambda_sex,  df = df_sex,  lower.tail = FALSE)
+p_race  <- pchisq(lambda_race, df = df_race, lower.tail = FALSE)
+p_sex_fmt   <- formatC(p_sex, format = "e", digits = 1)
+p_race_fmt  <- round(p_race, 4)
+```
+```{r tbl-lrt}
+#| tbl-cap: "Sequential likelihood ratio tests for the protected attributes."
+tibble(
+  Test = c("M0 vs M1: sex", "M1 vs M2: race"),
+  `$\\Lambda$` = c(lambda_sex, lambda_race),
+  `$q$` = c(df_sex, df_race),
+  `$p$-value` = c(p_sex_fmt, as.character(p_race_fmt))
+) |>
+  knitr::kable(booktabs = TRUE, escape = FALSE)
+```
+
+For sex, $\Lambda = `r lambda_sex`$ on $`r df_sex`$ df gives $p = `r p_sex_fmt`$, which is highly significant. For race, $\Lambda = `r lambda_race`$ on $`r df_race`$ df gives $p = `r p_race_fmt`$. The race test is *not* significant at the conventional 5\% level (though it would be at a 10\% level as $p = 0.085$). This is an important nuance: the joint race effect is marginal, not decisive, in the LRT framework.
+
+## Model selection
+
+```{r model-selection}
+aic_vals <- round(c(AIC(M0), AIC(M1), AIC(M2)), 1)
+bic_vals <- round(c(BIC(M0), BIC(M1), BIC(M2)), 1)
+```
+```{r tbl-aic}
+#| tbl-cap: "AIC and BIC model comparison (lower is better)."
+tibble(
+  Model = c("M0", "M1", "M2"),
+  AIC   = aic_vals,
+  BIC   = bic_vals
+) |>
+  knitr::kable(booktabs = TRUE)
+```
+
+AIC favours the full model, but BIC -- which penalises model complexity more heavily ($\log(n) \cdot p$ versus AIC's $2p$; for $n = `r nrow(compas)`$, $\log(n) \approx `r round(log(nrow(compas)), 1)`$) -- favours M1 (without race). The criteria disagree because the race effect is marginal: fit is slightly improved, but not enough to justify five additional parameters for BIC. The tension between these information criteria reflects the LRT finding and highlights an ambiguity in the data, as well as the usual accuracy-interpretability tradeoff.
+
+## Interpretation
+
+Having an LRT that is statistically significant is not enough to establish discrimination. However, it is enough to suggest significant *predictive relevance* for a covariate, as we can reject the null hypothesis, which would be to the contrary. However, it seems that the race test is marginal, despite the model having been established to display significant racial bias.^[See ProPublica's "Machine Bias", as referenced earlier.] This may be for one of two reasons. First, the legally permissible covariates (especially prior arrest count) may already absorb the race-associated variation, leaving little for race to explain. Second, the "race effect" and the "policing effect" may be unresolvable from the data alone, as the data possibly encodes differences in policing patterns between races, a well-known and systematic problem in the United States.
+
+Either way, it seems that, even when race is excluded from the model, there are proxies that bring it back in. Gender, on the other hand, is an already statistically significant covariate, and needs not to be proxy tested. We formally analyse proxy discrimination for race below.
+
+# Proxy discrimination analysis
+
+## Motivation
+
+As suggested above, race may re-enter the model through proxy discrimination when excluded via correlated covariates. A model may appear race-neutral when really using prior arrest count to encode the effect of the race variable anyway through different policing, which we will take as one possible explanation, but not prove to be statistically significant (this would require the use of more data and is generally a very difficult conclusion to determine).
+
+## Residual correlation with excluded attributes
+
+NB: although a correlation between M0's deviance residuals and the protected attributes it excludes could suggest partial model misspecification, it cannot say that deviance is caused by the exclusion of these attributes.
+
+```{r residual-correlation}
+compas_resid <- compas |>
+  mutate(
+    resid_m0 = residuals(M0, type = "deviance"),
+    race_black = as.integer(race == "African-American"),
+    sex_female = as.integer(sex == "Female")
+  )
+
+rho_race <- cor.test(compas_resid$resid_m0, compas_resid$race_black,
+                     method = "spearman", exact = FALSE)
+rho_sex  <- cor.test(compas_resid$resid_m0, compas_resid$sex_female,
+                     method = "spearman", exact = FALSE)
+
+rho_race_val <- round(rho_race$estimate, 3)
+rho_sex_val  <- round(rho_sex$estimate, 3)
+p_race_cor   <- round(rho_race$p.value, 4)
+p_sex_cor    <- formatC(rho_sex$p.value, format = "e", digits = 1)
+```
+
+The Spearman correlation coefficient between M0 residuals and the female indicator is $\rho = `r rho_sex_val`$ ($p = `r p_sex_cor`$), which is significant at the 5\% significance level, whereas for the African-American indicator this is $\rho = `r rho_race_val`$ ($p = `r p_race_cor`$), which is *not* significant. This backs up the LRT results, further suggesting that including sex in the model adds information beyond the legally permissible covariates, and race does not.
+
+## Proxy pathways: correlation structure
+
+```{r proxy-correlation}
+proxy_cors <- compas |>
+  mutate(race_black = as.integer(race == "African-American")) |>
+  summarise(
+    `Prior arrests` = round(cor(priors_count, race_black, method = "spearman"), 3),
+    Age             = round(cor(age, race_black, method = "spearman"), 3),
+    `Juv. felonies` = round(cor(juv_fel_count, race_black, method = "spearman"), 3)
+  ) |>
+  pivot_longer(everything(), names_to = "Covariate",
+               values_to = "Spearman rho with African-American")
+```
+```{r tbl-proxy}
+#| tbl-cap: "Spearman correlations between numeric covariates and the African-American indicator."
+knitr::kable(proxy_cors, booktabs = TRUE)
+```
+
+The strongest correlation of the African-American covariate is with prior arrests count. Again, this may be due to a policing differential -- communities subject to stricter surveillance will naturally accumulate more arrests. The implication is that prior arrests acts as a proxy for race. Whether this is a fair proxy or not is a harder question to answer: what size of difference in prior arrest count can be attributed to a policing differential? If this is not a significant amount then it may be that prior arrest count is actually a fair predictor of recidivism -- one that encodes race, but not necessarily racism.
+
+# Influence diagnostics
+
+## GLM leverage and Cook's distance
+
+In linear models, the hat matrix $\mathbf{H} = \mathbf{X}(\mathbf{X}^\top\mathbf{X})^{-1}\mathbf{X}^\top$ is a map from fitted responses to fitted values, with diagonal entries $h_{ii}$ measuring leverage (11.2 in the course notes). For GLMs, the associated quantity includes the weight matrix: $\mathbf{H} = \mathbf{W}^{1/2}\mathbf{X}(\mathbf{X}^\top\mathbf{W}\mathbf{X})^{-1}\mathbf{X}^\top\mathbf{W}^{1/2}$, and of course reduces to the linear model hat matrix when $\mathbf{W} = \mathbf{I}$. Cook's distance (11.3 in the course notes), combines leverage and residual magnitude, and can be used to measure how much the ith observation changes the estimator $\hat\beta$:
+
+$$
+C_i = \frac{(r_i^P)^2}{p} \cdot \frac{h_{ii}}{(1 - h_{ii})^2},
+$$
+```{r diagnostics}
+n <- nrow(compas)
+p <- length(coef(M2))
+
+compas_diag <- compas |>
+  mutate(
+    leverage  = hatvalues(M2),
+    cooks_d   = cooks.distance(M2),
+    influential = cooks_d > 4 / n
+  )
+
+n_influential <- sum(compas_diag$influential)
+```
+
+where $r_i^P$ is the Pearson residual. We then highlight observations with a distance greater than 4/n (a commonly used rule of thumb), of which there are `r n_influential`.
+
+## Demographic concentration of influence
+
+```{r tbl-influence-race}
+#| tbl-cap: "Proportion of influential observations by race versus sample share."
+compas_diag |>
+  group_by(race) |>
+  summarise(
+    `N in sample`       = n(),
+    `% of sample`       = round(100 * n() / nrow(compas_diag), 1),
+    `N influential`     = sum(influential),
+    `% of influential`  = round(100 * sum(influential) / n_influential, 1)
+  ) |>
+  arrange(desc(`N in sample`)) |>
+  knitr::kable(booktabs = TRUE)
+```
+
+@tbl-influence-race shows that the shares of influential observations are roughly proportional with group sizes, with a few caveats. It is clear that, though the Caucasian sample size is relatively large, it controls a small proportion of the sample of influential individuals. While the African-American sample is the largest, it also controls the largest proportion of influential individuals by far -- disproportionately so, considering its following Caucasian stratum is around 2/3 its size yet contributes only around 1/3 of its proportion of influential individuals. Moreover, with only 31 Asian and 11 Native American defendants, these two groups are dramatically over-represented among influential observations (as expected, individual observations have an outsized leverage on group-specific coefficients).
+
+This brings up the question whether it is more appropriate to model the races separately. This may be a weak case of Simpson's paradox -- small groups have large proportions of relatively influential defendants because they do not fit the patterns set by the larger groups in the sample. This could also incorrectly skew our model in the process. Overall however, influential observations control a small proportion of total observations (3.1\%), so we disregard their marginally negative effect on our model.
+
+# Binned residual diagnostic
+
+Raw residual plots are difficult to interpret for binary models as residuals take two distinct values for each covariate measurement. Using a *binned residual plot* is more appropriate here as this groups observations by fitted probability, plotting the average residual per bin against the bin midpoint, in pursuit of observations with large average residuals for a relatively small or large average fitted probability. A model fits well if approximately 95\% of binned residuals fall within $\pm 2\,\text{SE}$ bands. This is the analogue for logistic regression of the residual-fitted diagnostic for linear models (11.6 in the course notes).
+
+```{r fig-binned-resid}
+#| fig-cap: "Binned residual plot for M2. Points outside the dashed bands indicate local misfit."
+#| fig-width: 5.2
+#| fig-height: 2.1
+
+fitted_vals <- fitted(M2)
+raw_resid   <- compas$two_year_recid - fitted_vals
+n_bins <- 40
+bin_idx <- ntile(fitted_vals, n_bins)
+
+binned <- tibble(fitted = fitted_vals, resid = raw_resid, bin = bin_idx) |>
+  group_by(bin) |>
+  summarise(
+    x = mean(fitted),
+    y = mean(resid),
+    n = n(),
+    se = sqrt(mean(fitted) * (1 - mean(fitted)) / n),
+    .groups = "drop"
+  )
+
+ggplot(binned, aes(x = x, y = y)) +
+  geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.3) +
+  geom_line(aes(y =  2 * se), linetype = "dashed", colour = "grey50", linewidth = 0.3) +
+  geom_line(aes(y = -2 * se), linetype = "dashed", colour = "grey50", linewidth = 0.3) +
+  geom_point(size = 1.5, colour = "steelblue") +
+  labs(x = "Average fitted probability", y = "Average residual") +
+  theme_minimal(base_size = 9)
+```
+
+This plot for M2 shows most bins falling within the $\pm 2\,\text{SE}$ bands, suggesting an overall suitable fit. Any bins located outside these regions, of which there are only 8 from 40, are where the model locally over- or under- predicts.
+
+# Conclusion
+
+This analysis has applied generalised linear models, likelihood ratio testing, and regression diagnostics to the COMPAS recidivism dataset.
+
+Three findings emerge. Firstly, the LRT shows sex is a significant recidivism predictor after controlling for legally permissible covariates ($p < 0.001$), while the *joint* race effect is marginal (only $p \approx 0.085$). Secondly, the proxy analysis reveals why: prior arrest count correlates significantly with the African-American indicator ($\rho = 0.217$), implying most of the racial variation is absorbed before race itself enters the model. A race-blind model would therefore be moot as the race effect is partially reconstructed by this covariate. Lastly, diagnostic analysis confirms the robustness of these conclusions for the two major racial groups, though small-group coefficients are unstable. There is little to say about these anyway, as observation count has a large disparity between the most populous and least populous groups, effectively excluding them from the model.
+
+The main takeaway is not that COMPAS is biased because of its use of race, but that the covariate structure as a whole is racially inflected. An ostensibly race-neutral (legal) variable, prior arrest count encodes differences in policing between the groups, creating a negative feedback loop as stricter policing leads to harsher COMPAS judgements, leading to increased surveillance of African Americans. One possible solution would be to exclude prior arrests count from the model. However, this is intuitively a strong indicator of recidivism rate, and would likely be strongly correlated with observations even without the effects of the policing differential. Model fairness cannot be achieved by feature exclusion alone when the remaining features are themselves products of racially unequal enforcement practices. This leads back to an ethical question rather than a statistical one: do we exclude racially motivated predictors, even if they are the strongest that the model has? And, if not, how do we fairly account for proxy action when evaluating a feature's effect on model predictions?
+
+![Borden was rated high risk of recidivism after she and a friend took a bike that was sitting outside. She did not reoffend. Prater, labelled as minimal risk, has a history of armed robbery.](overestimation.png){width=30% fig-align="center"}
+
+# Critical use of AI tools
+
+Claude (Anthropic) was used during this coursework for structuring, generating initial R code for GLM fitting and diagnostics, and assisting with \LaTeX{}/Quarto typesetting. All statistical derivations --- including the GLM likelihood, the asymptotic normality of the MLE, the LRT chi-squared approximation (Wilks' theorem), and the Cook's distance formula --- were researched thoroughly and verified independently against the course notes before inclusion. All interpretations and conclusions are also my own, with only very light phrasing and formatting supervision.
+
+I found that the main limitation of AI assistance in statistics is that generated reasoning is fluent, but often incorrect. AI tools were used to speed up the more mundane parts of this work, though never as a substitute for statistical judgement.
